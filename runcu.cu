@@ -350,6 +350,67 @@ void rmsnorm(float *o, float *x, float *weight, int size)
     rmsnorm_kernel<<<1, num_threads_lrg>>>(o, x, weight, size, elementsPerThread);
 }
 
+
+__global__ void rmsnorm_kernel_multihead(float *o, float *x, float *weight, 
+                                         int head_dim, int elementsPerThread, 
+                                         int n_heads)
+{
+    __shared__ float sdata[num_threads_lrg];
+    
+    // Get head index from block ID
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    
+    // Calculate offsets for this head
+    float *head_input = x + head * head_dim;
+    float *head_output = o + head * head_dim;
+    // Note: weight is shared across all heads (same normalization weights)
+    
+    // compute partial sum of squares
+    float ss = 0.0f;
+    for (int i = 0; i < elementsPerThread; i++)
+    {
+        int j = threadIdx.x + i * num_threads_lrg;
+        if (j < head_dim)
+            ss += head_input[j] * head_input[j];
+    }
+    
+    sdata[threadIdx.x] = ss;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        __syncthreads();
+    }
+    
+    if (threadIdx.x == 0) {
+        ss = sdata[0] / head_dim + 1e-6f;
+        sdata[0] = 1.0f / sqrtf(ss);
+    }
+    __syncthreads();
+    ss = sdata[0];
+    
+    for (int i = 0; i < elementsPerThread; i++)
+    {
+        int j = threadIdx.x + i * num_threads_lrg;
+        if (j < head_dim)
+            head_output[j] = weight[j] * (ss * head_input[j]);
+    }
+}
+
+
+void rmsnorm_multihead(float *o, float *x, float *weight, int head_dim, int n_heads)
+{
+    int elementsPerThread = divUp(head_dim, num_threads_lrg);
+    
+    // Launch one block per head
+    rmsnorm_kernel_multihead<<<n_heads, num_threads_lrg>>>(
+        o, x, weight, head_dim, elementsPerThread, n_heads
+    );
+}
+
+
 //========== Softmax in GPU =====
 __device__ void softmax_gpu(float *__restrict__ x, int size)
 {
@@ -574,50 +635,41 @@ void accum(float *a, float *b, int size)
     accum_kernel<<<divUp(size, num_threads_med), num_threads_med>>>(a, b, size);
 }
 
-//========= ROPE ========= TODO
-__global__ void q_RoPe_rotation_kernel(int pos, float *qq,  int head_dim, int kv_dim, int att_head_dim)
+
+// Unified kernel for both Q and K RoPE rotation
+__global__ void RoPe_rotation_kernel_multihead(int pos, float *tensor, int head_dim, 
+                                               int kv_dim, int att_head_dim, int n_heads)
 {
+    // Get head and element indices
+    int head = blockIdx.x;
     int i = threadIdx.x;
-    if(i < head_dim / 2)
-    {
-        float freq = 1.0f / powf(1000000.0f, (float)i / (head_dim / 2));
-        float fcr = cosf(pos * freq);
-        float fci = sinf(pos * freq);
+    
+    if (head >= n_heads || i >= head_dim / 2) return;
+    
+    // Calculate offset for this head
+    float *head_tensor = tensor + head * head_dim;
+    
+    float freq = 1.0f / powf(1000000.0f, (float)i / (head_dim / 2));
+    float fcr = cosf(pos * freq);
+    float fci = sinf(pos * freq);
 
-        // Rotate query head
-        float x_q = qq[i];
-        float y_q = qq[i + head_dim / 2];
-        qq[i] = x_q * fcr - y_q * fci;
-        qq[i + head_dim / 2] = x_q * fci + y_q * fcr;
-        }
+    // Rotate tensor head (works for both Q and K)
+    float x = head_tensor[i];
+    float y = head_tensor[i + head_dim / 2];
+    head_tensor[i] = x * fcr - y * fci;
+    head_tensor[i + head_dim / 2] = x * fci + y * fcr;
 }
 
-__global__ void k_RoPe_rotation_kernel(int pos, float *kk, int head_dim, int kv_dim, int att_head_dim)
+// Unified host function for both Q and K RoPE rotation
+void RoPe_rotation_multihead(int pos, float *tensor, int head_dim, int kv_dim, 
+                            int att_head_dim, int n_heads)
 {
-    int i = threadIdx.x;
-    if (i < head_dim / 2)
-    {
-        float freq = 1.0f / powf(1000000.0f, (float)i / (head_dim / 2));
-        float fcr = cosf(pos * freq);
-        float fci = sinf(pos * freq);
-
-        // Rotate query head
-        float x_q = kk[i];
-        float y_q = kk[i + head_dim / 2];
-        kk[i] = x_q * fcr - y_q * fci;
-        kk[i + head_dim / 2] = x_q * fci + y_q * fcr;
-    }
+    // Launch one block per head, threads per element
+    RoPe_rotation_kernel_multihead<<<n_heads, head_dim / 2>>>(
+        pos, tensor, head_dim, kv_dim, att_head_dim, n_heads
+    );
 }
 
-void q_RoPe_rotation(int pos, float *qq, int head_dim, int kv_dim, int att_head_dim)
-{
-    q_RoPe_rotation_kernel<<<1, head_dim /2>>>(pos, qq,  head_dim, kv_dim, att_head_dim);
-}
-
-void k_RoPe_rotation(int pos, float *kk, int head_dim, int kv_dim, int att_head_dim)
-{
-    q_RoPe_rotation_kernel<<<1, head_dim / 2>>>(pos, kk, head_dim, kv_dim, att_head_dim);
-}
 
 //======================================
 // FORWARD PASS
@@ -650,27 +702,18 @@ float *forward(Transformer *transformer, int token, int pos)
         // Query, key, value computation
         matmul(s->q, s->xb, w->wq + l *layer_offset, p->dim, att_head_dim); 
         matmul(s->k, s->xb, w->wk + l *layer_offset, p->dim, kv_dim);  
-        matmul(s->v, s->xb, w->wv + l *layer_offset, p->dim, kv_dim);   
+        matmul(s->v, s->xb, w->wv + l *layer_offset, p->dim, kv_dim);
 
-        // Query RoPE - TODO
-       for (int h = 0; h < p->n_heads; h++) {
-           float *q = s->q + h * p->head_dim;
-       
-           // Apply RMSNorm to query head
-           rmsnorm(q, q, w->wq_norm + l * layer_offset, p->head_dim);
-           q_RoPe_rotation(pos, q, p->head_dim, kv_dim, att_head_dim);
-       }
+        // Apply RMSNorm to ALL query heads
+        rmsnorm_multihead(s->q, s->q, w->wq_norm + l * layer_offset, p->head_dim, p->n_heads);
+        // Apply RoPE to Q
+        RoPe_rotation_multihead(pos, s->q, p->head_dim, kv_dim, att_head_dim, p->n_heads);
 
-        // Key RoPE - TODO
-        for (int h = 0; h < p->n_kv_heads; h++) {
-            float *k = s->k + h * p->head_dim;
-           // Apply RMSNorm to key head if within n_kv_heads
-
-            rmsnorm(k, k, w->wk_norm + l * layer_offset, p->head_dim);
-            k_RoPe_rotation(pos, k, p->head_dim, kv_dim, att_head_dim);
-
-        }
-       
+        // Apply RMSNorm to ALL key heads 
+        rmsnorm_multihead(s->k, s->k, w->wk_norm + l * layer_offset, p->head_dim, p->n_kv_heads);
+        // Apply RoPE to K
+        RoPe_rotation_multihead(pos, s->k, p->head_dim, kv_dim, att_head_dim, p->n_kv_heads);
+              
         multi_head_attention(pos, p, s, kv_dim, kv_mul, p->head_dim, loff);
         
         // Output projection
@@ -1301,8 +1344,8 @@ void error_usage() {
     fprintf(stderr, "Usage:   run <FP32 GGUF file> [options]\n");
     fprintf(stderr, "Example: ./run Qwen3-0.6B-FP32.gguf\n");  
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.6\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.95\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -m <int>    multi-turn: 0 = off (defualt), 1 = on\n");
     fprintf(stderr, "  -k <int>    reasoning: 0 = off (defualt), 1 = on\n");

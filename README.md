@@ -8,6 +8,10 @@ Even though GGUF files already include a binary tokenizer, this project reads vo
 
 It also supports multi-turn conversation out of the box, and native support for Qwen3’s reasoning mode. For reference, there’s also a cuBLAS version included. It’s roughly 2x faster for now, but I’ll probably try to narrow that gap in the future. I’ll add more explanation on the code later.
 
+### UPDATE
+[Aug-08-25] Remove the nonsense loop. TPS increased from ~35 to ~39. Set base for benchmarking.
+[What's next] Improve kernels
+
 ## Quick Start
 
 ```sh
