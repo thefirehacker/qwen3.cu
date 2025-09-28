@@ -1,4 +1,4 @@
-/* Inference for GGUF Qwen-3 models in pure C */
+/* Inference for GGUF Qwen-3 models in pure CUDA */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1236,7 +1236,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 
 // ----------------------------------------------------------------------------
 // chat loop
-void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* cli_user_prompt, char* cli_system_prompt, int think_on, int multi_turn, int tps, TokenBuffer* tb) {
+void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* cli_user_prompt, char* cli_system_prompt, int think_on, int multi_turn, int tps, int ttft, TokenBuffer* tb) {
     // buffers for reading the system prompt and user prompt from stdin
     char system_prompt[512];
     char user_prompt[8192]; 
@@ -1252,6 +1252,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
     //int prev_token;
     int pos = 0;     // position in the sequence
     double timer = -1.0;   // TPS timer start
+    long timer2 = -1;  // TTFT timer start
+    long t_ttft = 0;       // TTFT 
     int count = 0;         // decoded token
 
      while (1) { 
@@ -1264,6 +1266,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
                 if (!user_prompt[0]) {
                     break;
                 }
+                // TTFT starts
+                if (ttft && timer2 == -1) {timer2 = time_in_ms();}
 
             // render user/system prompts for Qwen3 
             if (pos == 0 && system_prompt[0] != '\0') {
@@ -1321,6 +1325,11 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
                 timer = -1;
                 count = 0;
                 }
+                //TTFT
+                if (ttft) {
+                    fprintf(stderr, "TTFT: %ld ms\n", t_ttft);
+                    timer2 = -1; t_ttft = 0;
+                }
             }
             else {
             char *decoded = decode_token_id(next);
@@ -1328,6 +1337,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char
             fflush(stdout);
             free(decoded);
 
+                if (ttft && t_ttft==0) {t_ttft = time_in_ms() - timer2;}
                 if (tps) {
                     count += 1;
                     // timer starts after the first token generation
@@ -1350,6 +1360,7 @@ void error_usage() {
     fprintf(stderr, "  -m <int>    multi-turn: 0 = off (defualt), 1 = on\n");
     fprintf(stderr, "  -k <int>    reasoning: 0 = off (defualt), 1 = on\n");
     fprintf(stderr, "  -r <int>    TPS: 0 = off (defualt), 1 = on\n");
+    fprintf(stderr, "  -f <int>    ttFt: 0 = off (defualt), 1 = on\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1366,6 +1377,7 @@ int main(int argc, char *argv[]) {
     int multi_turn = 0;  // multi-turn conversation
     int think_on = 0;    //  reasoning on
     int tps = 0;         // TPS 
+    int ttft = 0;        // TTFT
 
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
@@ -1383,6 +1395,8 @@ int main(int argc, char *argv[]) {
         think_on = argv[i+1][0] - '0';} else { error_usage(); } }
         else if (argv[i][1] == 'r') {if ((argv[i+1][0] == '0' || argv[i+1][0] == '1') && argv[i+1][1] == '\0') {
         tps = argv[i+1][0] - '0';} else { error_usage(); } }
+        else if (argv[i][1] == 'f') {if ((argv[i+1][0] == '0' || argv[i+1][0] == '1') && argv[i+1][1] == '\0') {
+        ttft = argv[i+1][0] - '0';} else { error_usage(); } }
         else { error_usage(); }        
     }
 
@@ -1415,11 +1429,11 @@ int main(int argc, char *argv[]) {
     create_cublas_handle();
     #endif
 
-    printf("Multi-turn = %s, thinKing = %s, tps(R) = %s, Temperature = %.2f, top-P = %.2f\n", multi_turn ? "on" : "off", think_on ? "on" : "off", tps ? "on" : "off", temperature, topp);
+    printf("Multi-turn = %s, thinKing = %s, tps(R) = %s, ttFt = %s, Temperature = %.2f, top-P = %.2f\n", multi_turn ? "on" : "off", think_on ? "on" : "off", tps ? "on" : "off", ttft ? "on" : "off", temperature, topp);
     printf("Press Enter to exit the chat\n");
 
     // run!
-    chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, think_on, multi_turn, tps, &tb); 
+    chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, think_on, multi_turn, tps, ttft, &tb); 
 
     // memory and file handles cleanup
     free_sampler(&sampler); 
