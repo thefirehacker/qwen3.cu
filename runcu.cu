@@ -513,8 +513,11 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
         
         if (i < d) {
             float sum = 0.0f;
-            int chunk_size = min(blockDim.x, n - offset);
             
+            //TUNING
+            int chunk_size =  64;
+            //int chunk_size = min(blockDim.x, n - offset);
+
             // Vectorized loads and computation
             float4 *w_vec = (float4*)(w + i * n + offset);
             float4 *x_vec = (float4*)shared_x;
@@ -539,7 +542,8 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 }
 
 void matmul(float *xout, float *x, float *w, int n, int d) {
-    int block_size = 256;
+    // TUNING - change from 256
+    int block_size =  64; 
     int grid_size = (d + block_size - 1) / block_size;
     int shared_mem = block_size * sizeof(float);
     matmul_kernel<<<grid_size, block_size, shared_mem>>>(xout, x, w, n, d);

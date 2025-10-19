@@ -1,19 +1,18 @@
 /* Inference for GGUF Qwen-3 models in pure CUDA */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <cuda_runtime.h>
 
-#define BLOCK_SIZE 256
 
-
-__global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+__global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d, int chunk_size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
     
     extern __shared__ float shared_x[];
     
     // Load x into shared memory in chunks
-    for (int offset = 0; offset < n; offset += blockDim.x) {
+    for (int offset = 0; offset < n; offset += chunk_size) {
         if (offset + tid < n) {
             shared_x[tid] = x[offset + tid];
         }
@@ -21,13 +20,13 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
         
         if (i < d) {
             float sum = 0.0f;
-            int chunk_size = min(blockDim.x, n - offset);
+            int current_chunk_size = min(chunk_size, n - offset);
             
             // Vectorized loads and computation
             float4 *w_vec = (float4*)(w + i * n + offset);
             float4 *x_vec = (float4*)shared_x;
             
-            int vec_ops = chunk_size / 4;
+            int vec_ops = current_chunk_size / 4;
             for (int v = 0; v < vec_ops; v++) {
                 float4 w4 = w_vec[v];
                 float4 x4 = x_vec[v];
@@ -35,7 +34,7 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
             }
             
             // Handle remaining elements
-            for (int j = vec_ops * 4; j < chunk_size; j++) {
+            for (int j = vec_ops * 4; j < current_chunk_size; j++) {
                 sum += w[i * n + offset + j] * shared_x[j];
             }
             
@@ -46,11 +45,9 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
     }
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d, int b_size) {
-    int block_size = b_size;
+void matmul(float *xout, float *x, float *w, int n, int d, int block_size, int chunk_size, int shared_mem_size) {
     int grid_size = (d + block_size - 1) / block_size;
-    int shared_mem = block_size * sizeof(float);
-    matmul_kernel<<<grid_size, block_size, shared_mem>>>(xout, x, w, n, d);
+    matmul_kernel<<<grid_size, block_size, shared_mem_size>>>(xout, x, w, n, d, chunk_size);
 }
 
 
@@ -87,54 +84,80 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_x, h_x, n * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_w, h_w, d * n * sizeof(float), cudaMemcpyHostToDevice);
     
-    // Block sizes to test
+    // Parameters to test
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int chunk_sizes[] = {32, 64, 128, 256, 512, 1024, 2048, 4096};
     int num_block_sizes = sizeof(block_sizes) / sizeof(block_sizes[0]);
+    int num_chunk_sizes = sizeof(chunk_sizes) / sizeof(chunk_sizes[0]);
     
     float best_gflops = 0.0f;
     int best_block_size = 0;
+    int best_chunk_size = 0;
     
-    // Test each block size
+    // Test each combination
     for (int bs_idx = 0; bs_idx < num_block_sizes; bs_idx++) {
         int block_size = block_sizes[bs_idx];
         
-        // Warmup
-        for (int i = 0; i < warmup; i++) {
-            matmul(d_xout, d_x, d_w, n, d, block_size);
+        for (int cs_idx = 0; cs_idx < num_chunk_sizes; cs_idx++) {
+            int chunk_size = chunk_sizes[cs_idx];
+            int shared_mem_size = chunk_size * sizeof(float);
+            
+            // Skip if shared memory is too large
+            cudaDeviceProp prop;
+            cudaGetDeviceProperties(&prop, 0);
+            if (shared_mem_size > prop.sharedMemPerBlock) {
+                continue;
+            }
+            
+            // Warmup
+            for (int i = 0; i < warmup; i++) {
+                matmul(d_xout, d_x, d_w, n, d, block_size, chunk_size, shared_mem_size);
+            }
+            cudaDeviceSynchronize();
+            
+            // Check for errors
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("block_size=%4d, chunk_size=%4d: SKIP (error: %s)\n", 
+                       block_size, chunk_size, cudaGetErrorString(err));
+                continue;
+            }
+            
+            // Benchmark
+            cudaEvent_t start, stop;
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+            
+            cudaEventRecord(start);
+            for (int i = 0; i < iterations; i++) {
+                matmul(d_xout, d_x, d_w, n, d, block_size, chunk_size, shared_mem_size);
+            }
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            
+            float milliseconds = 0;
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            
+            // Calculate metrics
+            float avg_time = milliseconds / iterations;
+            float gflops = (2.0f * n * d / 1e9) / (avg_time / 1000.0f);
+            
+            printf("block_size=%4d, chunk_size=%4d, shared_mem=%5d KB: %.4f ms, %.2f GFLOPS\n", 
+                   block_size, chunk_size, shared_mem_size / 1024, avg_time, gflops);
+            
+            if (gflops > best_gflops) {
+                best_gflops = gflops;
+                best_block_size = block_size;
+                best_chunk_size = chunk_size;
+            }
+            
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
         }
-        cudaDeviceSynchronize();
-        
-        // Benchmark
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        
-        cudaEventRecord(start);
-        for (int i = 0; i < iterations; i++) {
-            matmul(d_xout, d_x, d_w, n, d, block_size);
-        }
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        
-        float milliseconds = 0;
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        
-        // Calculate metrics
-        float avg_time = milliseconds / iterations;
-        float gflops = (2.0f * n * d / 1e9) / (avg_time / 1000.0f);
-        
-        printf("block_size=%4d: %.4f ms, %.2f GFLOPS\n", block_size, avg_time, gflops);
-        
-        if (gflops > best_gflops) {
-            best_gflops = gflops;
-            best_block_size = block_size;
-        }
-        
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
     }
     
-    printf("\nBest configuration: block_size=%d (%.2f GFLOPS)\n", best_block_size, best_gflops);
+    printf("\nBest configuration: block_size=%d, chunk_size=%d (%.2f GFLOPS)\n", 
+           best_block_size, best_chunk_size, best_gflops);
     
     // Copy result back
     cudaMemcpy(h_xout, d_xout, d * sizeof(float), cudaMemcpyDeviceToHost);
