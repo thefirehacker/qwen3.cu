@@ -549,17 +549,36 @@ def main():
     input_token_ids = tokenizer.encode(prompt)
     input_token_ids_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
     
-    for token in generate_text_basic_stream(
+    # ------------------ Decoding TPS measurement ------------------
+    import time
+    generated_tokens = 0
+    start_time = None       # timer starts after prefill
+
+    stream = generate_text_basic_stream(
         model=model,
         token_ids=input_token_ids_tensor,
         max_new_tokens=500,
         eos_token_id=tokenizer.eos_token_id
-    ):
+    )
+
+    for token in stream:
+        # Start timing AFTER first token is generated
+        # because the first call includes prefill
+        if start_time is None:
+            start_time = time.time()
+
         token_id = token.squeeze(0).tolist()
         print(tokenizer.decode(token_id), end="", flush=True)
-    
-    print("\n")
+        generated_tokens += 1
 
+    end_time = time.time()
+    elapsed = end_time - start_time
+
+    print("\n")
+    print(f"Generated tokens: {generated_tokens}")
+    print(f"Time (decoding only): {elapsed:.3f} seconds")
+    print(f"TPS (tokens/sec): {generated_tokens / elapsed:.2f}")
+    print()
 
 if __name__ == "__main__":
     main()
