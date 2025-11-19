@@ -71,7 +71,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
     return cos, sin
 
 
-def apply_rope(x, cos, sin):
+def apply_rope(x, cos, sin, offset=0):
     # x: (batch_size, num_heads, seq_len, head_dim)
     batch_size, num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
@@ -81,8 +81,8 @@ def apply_rope(x, cos, sin):
     x2 = x[..., head_dim // 2 :]  # Second half
 
     # Adjust sin and cos shapes
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    cos = cos[offset:offset + seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
+    sin = sin[offset:offset + seq_len, :].unsqueeze(0).unsqueeze(0)
 
     # Apply the rotary transformation
     rotated = torch.cat((-x2, x1), dim=-1)
@@ -92,7 +92,7 @@ def apply_rope(x, cos, sin):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None):
+    def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None, start_pos=0, cache=None):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
 
@@ -119,7 +119,7 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.q_norm = self.k_norm = None
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         b, num_tokens, _ = x.shape
 
         # Apply projections
@@ -129,18 +129,28 @@ class GroupedQueryAttention(nn.Module):
 
         # Reshape
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
+        keys_new = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
+        values_new = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
 
         # Optional normalization
         if self.q_norm:
             queries = self.q_norm(queries)
         if self.k_norm:
-            keys = self.k_norm(keys)
+            keys_new = self.k_norm(keys_new)
 
         # Apply RoPE
-        queries = apply_rope(queries, cos, sin)
-        keys = apply_rope(keys, cos, sin)
+        queries = apply_rope(queries, cos, sin, offset=start_pos)
+        keys_new = apply_rope(keys_new, cos, sin, offset=start_pos)
+
+        if cache is not None:
+            prev_k, prev_v = cache
+            keys = torch.cat([prev_k, keys_new], dim=2)
+            values = torch.cat([prev_v, values_new], dim=2)
+            next_cache = (keys, values)
+        else:
+            start_pos = 0  # reset RoPE
+            keys, values = keys_new, values_new
+            next_cache = (keys, values)
 
         # Expand K and V to match number of heads
         keys = keys.repeat_interleave(self.group_size, dim=1)
@@ -152,7 +162,7 @@ class GroupedQueryAttention(nn.Module):
         attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
         context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
-        return self.out_proj(context)
+        return self.out_proj(context), next_cache
 
 
 class TransformerBlock(nn.Module):
@@ -170,20 +180,20 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x, mask, cos, sin)
-        x = x + shortcut
+        x, next_cache = self.att(x, mask, cos, sin, start_pos=start_pos, cache=cache)  # Shape [batch_size, num_tokens, emb_size]
+        x = x + shortcut  # Add the original input back
 
         # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
-        x = x + shortcut
+        x = x + shortcut  # Add the original input back
 
-        return x
+        return x, next_cache
 
 
 class Qwen3Model(nn.Module):
@@ -213,20 +223,61 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.cfg = cfg
+        self.current_pos = 0  # Track current position in KV cache
 
-    def forward(self, in_idx):
+    def forward(self, in_idx, cache=None):
         # Forward pass
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
 
         num_tokens = x.shape[1]
-        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
-        
-        for block in self.trf_blocks:
-            x = block(x, mask, self.cos, self.sin)
+        if cache is not None:
+            pos_start = self.current_pos
+            pos_end = pos_start + num_tokens
+            self.current_pos = pos_end
+            mask = torch.triu(
+                torch.ones(pos_end, pos_end, device=x.device, dtype=torch.bool), diagonal=1
+            )[pos_start:pos_end, :pos_end]
+        else:
+            pos_start = 0  # Not strictly necessary but helps torch.compile
+            mask = torch.triu(
+                torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1
+            )
+        # Shape (1, 1, num_tokens, num_tokens) to broadcast across batch and heads
+        mask = mask[None, None, :, :]
+
+        for i, block in enumerate(self.trf_blocks):
+            blk_cache = cache.get(i) if cache else None
+            x, new_blk_cache = block(x, mask, self.cos, self.sin,
+                                     start_pos=pos_start,
+                                     cache=blk_cache)
+            if cache is not None:
+                cache.update(i, new_blk_cache)
+
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
         return logits
+
+    def reset_kv_cache(self):
+        self.current_pos = 0
+        
+        
+class KVCache:
+    def __init__(self, n_layers):
+        self.cache = [None] * n_layers
+
+    def get(self, layer_idx):
+        return self.cache[layer_idx]
+
+    def update(self, layer_idx, value):
+        self.cache[layer_idx] = value
+
+    def get_all(self):
+        return self.cache
+
+    def reset(self):
+        for i in range(len(self.cache)):
+            self.cache[i] = None        
 
 
 # ==================== Tokenizer ====================
@@ -318,7 +369,7 @@ def get_model_config(model_size):
             "qk_norm": True,
             "n_kv_groups": 8,
             "rope_base": 1_000_000.0,
-            "dtype": torch.bfloat16,
+            "dtype": torch.float32,
         }
     }
     
@@ -456,27 +507,35 @@ def download_and_load_weights(model_size, use_instruct=True, use_reasoning=False
     return weights_dict, repo_id, local_dir
 
 
-def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
-    """Generate text token by token (streaming)."""
+def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None, context_size=None):
     model.eval()
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            out = model(token_ids)[:, -1]
-            next_token = torch.argmax(out, dim=-1, keepdim=True)
 
-            if (eos_token_id is not None and torch.all(next_token == eos_token_id)):
+    with torch.no_grad():
+        cache = KVCache(n_layers=model.cfg["n_layers"])
+        model.reset_kv_cache()
+
+        # Prime the cache with the initial context
+        logits = model(token_ids, cache=cache)
+
+        for _ in range(max_new_tokens):
+            next_token = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
+
+            if eos_token_id is not None and torch.all(next_token == eos_token_id):
                 break
 
             yield next_token
-            
+
             token_ids = torch.cat([token_ids, next_token], dim=1)
+
+            # Feed only the new token to the model; cache handles history
+            logits = model(next_token, cache=cache)
 
 
 # ==================== Main Execution ====================
 
 def main():
     # Configuration
-    MODEL_SIZE = "0.6B"  # Options: "0.6B", "1.7B", "4B", "8B", "14B", "32B"
+    MODEL_SIZE = "0.6B"
     USE_INSTRUCT_MODEL = True
     USE_REASONING_MODEL = False
     
@@ -513,8 +572,11 @@ def main():
     )
     
     load_weights_into_qwen(model, config, weights_dict)
-    model.to(device)
+    model.to(device, dtype=torch.float32) 
     del weights_dict
+    
+    # Using torch.compile
+    #model = torch.compile(model) 
     
     # Load tokenizer
     print("Loading tokenizer...")
@@ -579,6 +641,7 @@ def main():
     print(f"Time (decoding only): {elapsed:.3f} seconds")
     print(f"TPS (tokens/sec): {generated_tokens / elapsed:.2f}")
     print()
+
 
 if __name__ == "__main__":
     main()
